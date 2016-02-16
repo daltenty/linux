@@ -196,55 +196,13 @@ static void intel_enable_dvo(struct intel_encoder *encoder)
 	intel_dvo->dev.dev_ops->dpms(&intel_dvo->dev, true);
 }
 
-/* Special dpms function to support cloning between dvo/sdvo/crt. */
-static void intel_dvo_dpms(struct drm_connector *connector, int mode)
-{
-	struct intel_dvo *intel_dvo = intel_attached_dvo(connector);
-	struct drm_crtc *crtc;
-	struct intel_crtc_state *config;
-
-	/* dvo supports only 2 dpms states. */
-	if (mode != DRM_MODE_DPMS_ON)
-		mode = DRM_MODE_DPMS_OFF;
-
-	if (mode == connector->dpms)
-		return;
-
-	connector->dpms = mode;
-
-	/* Only need to change hw state when actually enabled */
-	crtc = intel_dvo->base.base.crtc;
-	if (!crtc) {
-		intel_dvo->base.connectors_active = false;
-		return;
-	}
-
-	/* We call connector dpms manually below in case pipe dpms doesn't
-	 * change due to cloning. */
-	if (mode == DRM_MODE_DPMS_ON) {
-		config = to_intel_crtc(crtc)->config;
-
-		intel_dvo->base.connectors_active = true;
-
-		intel_crtc_update_dpms(crtc);
-
-		intel_dvo->dev.dev_ops->dpms(&intel_dvo->dev, true);
-	} else {
-		intel_dvo->dev.dev_ops->dpms(&intel_dvo->dev, false);
-
-		intel_dvo->base.connectors_active = false;
-
-		intel_crtc_update_dpms(crtc);
-	}
-
-	intel_modeset_check_state(connector->dev);
-}
-
 static enum drm_mode_status
 intel_dvo_mode_valid(struct drm_connector *connector,
 		     struct drm_display_mode *mode)
 {
 	struct intel_dvo *intel_dvo = intel_attached_dvo(connector);
+	int max_dotclk = to_i915(connector->dev)->max_dotclk_freq;
+	int target_clock = mode->clock;
 
 	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
 		return MODE_NO_DBLESCAN;
@@ -256,7 +214,12 @@ intel_dvo_mode_valid(struct drm_connector *connector,
 			return MODE_PANEL;
 		if (mode->vdisplay > intel_dvo->panel_fixed_mode->vdisplay)
 			return MODE_PANEL;
+
+		target_clock = intel_dvo->panel_fixed_mode->clock;
 	}
+
+	if (target_clock > max_dotclk)
+		return MODE_CLOCK_HIGH;
 
 	return intel_dvo->dev.dev_ops->mode_valid(&intel_dvo->dev, mode);
 }
@@ -387,7 +350,7 @@ static void intel_dvo_destroy(struct drm_connector *connector)
 }
 
 static const struct drm_connector_funcs intel_dvo_connector_funcs = {
-	.dpms = intel_dvo_dpms,
+	.dpms = drm_atomic_helper_connector_dpms,
 	.detect = intel_dvo_detect,
 	.destroy = intel_dvo_destroy,
 	.fill_modes = drm_helper_probe_single_connector_modes,

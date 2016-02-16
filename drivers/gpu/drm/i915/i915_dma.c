@@ -163,6 +163,13 @@ static int i915_getparam(struct drm_device *dev, void *data,
 		if (!value)
 			return -ENODEV;
 		break;
+	case I915_PARAM_HAS_GPU_RESET:
+		value = i915.enable_hangcheck &&
+			intel_has_gpu_reset(dev);
+		break;
+	case I915_PARAM_HAS_RESOURCE_STREAMER:
+		value = HAS_RESOURCE_STREAMER(dev);
+		break;
 	default:
 		DRM_DEBUG("Unknown parameter %d\n", param->param);
 		return -EINVAL;
@@ -428,6 +435,11 @@ static int i915_load_modeset_init(struct drm_device *dev)
 	 * working irqs for e.g. gmbus and dp aux transfers. */
 	intel_modeset_init(dev);
 
+	/* intel_guc_ucode_init() needs the mutex to allocate GEM objects */
+	mutex_lock(&dev->struct_mutex);
+	intel_guc_ucode_init(dev);
+	mutex_unlock(&dev->struct_mutex);
+
 	ret = i915_gem_init(dev);
 	if (ret)
 		goto cleanup_irq;
@@ -469,6 +481,9 @@ cleanup_gem:
 	i915_gem_context_fini(dev);
 	mutex_unlock(&dev->struct_mutex);
 cleanup_irq:
+	mutex_lock(&dev->struct_mutex);
+	intel_guc_ucode_fini(dev);
+	mutex_unlock(&dev->struct_mutex);
 	drm_irq_uninstall(dev);
 cleanup_gem_stolen:
 	i915_gem_cleanup_stolen(dev);
@@ -719,11 +734,19 @@ static void intel_device_info_runtime_init(struct drm_device *dev)
 
 	info = (struct intel_device_info *)&dev_priv->info;
 
+	/*
+	 * Skylake and Broxton currently don't expose the topmost plane as its
+	 * use is exclusive with the legacy cursor and we only want to expose
+	 * one of those, not both. Until we can safely expose the topmost plane
+	 * as a DRM_PLANE_TYPE_CURSOR with all the features exposed/supported,
+	 * we don't expose the topmost plane at all to prevent ABI breakage
+	 * down the line.
+	 */
 	if (IS_BROXTON(dev)) {
-		info->num_sprites[PIPE_A] = 3;
-		info->num_sprites[PIPE_B] = 3;
-		info->num_sprites[PIPE_C] = 2;
-	} else if (IS_VALLEYVIEW(dev) || INTEL_INFO(dev)->gen == 9)
+		info->num_sprites[PIPE_A] = 2;
+		info->num_sprites[PIPE_B] = 2;
+		info->num_sprites[PIPE_C] = 1;
+	} else if (IS_VALLEYVIEW(dev))
 		for_each_pipe(dev_priv, pipe)
 			info->num_sprites[pipe] = 2;
 	else
@@ -776,6 +799,24 @@ static void intel_device_info_runtime_init(struct drm_device *dev)
 			 info->has_eu_pg ? "y" : "n");
 }
 
+static void intel_init_dpio(struct drm_i915_private *dev_priv)
+{
+	if (!IS_VALLEYVIEW(dev_priv))
+		return;
+
+	/*
+	 * IOSF_PORT_DPIO is used for VLV x2 PHY (DP/HDMI B and C),
+	 * CHV x1 PHY (DP/HDMI D)
+	 * IOSF_PORT_DPIO_2 is used for CHV x2 PHY (DP/HDMI B and C)
+	 */
+	if (IS_CHERRYVIEW(dev_priv)) {
+		DPIO_PHY_IOSF_PORT(DPIO_PHY0) = IOSF_PORT_DPIO_2;
+		DPIO_PHY_IOSF_PORT(DPIO_PHY1) = IOSF_PORT_DPIO;
+	} else {
+		DPIO_PHY_IOSF_PORT(DPIO_PHY0) = IOSF_PORT_DPIO;
+	}
+}
+
 /**
  * i915_driver_load - setup chip and create an initial config
  * @dev: DRM device
@@ -787,6 +828,8 @@ static void intel_device_info_runtime_init(struct drm_device *dev)
  *   - allocate initial config memory
  *   - setup the DRM framebuffer with the allocated memory
  */
+struct drm_i915_private *gpu_perf_dev_priv;
+
 int i915_driver_load(struct drm_device *dev, unsigned long flags)
 {
 	struct drm_i915_private *dev_priv;
@@ -800,7 +843,8 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
 	if (dev_priv == NULL)
 		return -ENOMEM;
 
-	dev->dev_private = dev_priv;
+	dev->dev_private = (void *)dev_priv;
+	gpu_perf_dev_priv = (void *)dev_priv;
 	dev_priv->dev = dev;
 
 	/* Setup the write-once "constant" device info */
@@ -861,6 +905,23 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
 	intel_detect_pch(dev);
 
 	intel_uncore_init(dev);
+
+	if (i915_start_vgt(dev->pdev))
+		i915_host_mediate = true;
+	printk("i915_start_vgt: %s\n", i915_host_mediate ? "success" : "fail");
+
+	if (i915_host_mediate) {
+		extern bool (*tmp_vgt_can_process_timer)(void *timer);
+		extern void (*tmp_vgt_new_delay_event_timer)(void *timer);
+
+		tmp_vgt_new_delay_event_timer = vgt_new_delay_event_timer;
+		tmp_vgt_can_process_timer = vgt_can_process_timer;
+	}
+
+	i915_check_vgpu(dev);
+
+	if (intel_vgpu_active(dev))
+		i915.enable_ips = 0;
 
 	/* Load CSR Firmware for SKL */
 	intel_csr_ucode_init(dev);
@@ -976,6 +1037,8 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
 
 	intel_device_info_runtime_init(dev);
 
+	intel_init_dpio(dev_priv);
+
 	if (INTEL_INFO(dev)->num_pipes) {
 		ret = drm_vblank_init(dev, INTEL_INFO(dev)->num_pipes);
 		if (ret)
@@ -1087,6 +1150,11 @@ int i915_driver_unload(struct drm_device *dev)
 
 	intel_modeset_cleanup(dev);
 
+	if (i915_host_mediate) {
+		i915_stop_vgt();
+		i915_host_mediate = false;
+	}
+
 	/*
 	 * free the memory space allocated for the child device
 	 * config parsed from VBT
@@ -1113,9 +1181,11 @@ int i915_driver_unload(struct drm_device *dev)
 	flush_workqueue(dev_priv->wq);
 
 	mutex_lock(&dev->struct_mutex);
+	intel_guc_ucode_fini(dev);
 	i915_gem_cleanup_ringbuffer(dev);
 	i915_gem_context_fini(dev);
 	mutex_unlock(&dev->struct_mutex);
+	intel_fbc_cleanup_cfb(dev_priv);
 	i915_gem_cleanup_stolen(dev);
 
 	intel_csr_ucode_fini(dev);
@@ -1255,16 +1325,7 @@ const struct drm_ioctl_desc i915_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(I915_GEM_USERPTR, i915_gem_userptr_ioctl, DRM_UNLOCKED|DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(I915_GEM_CONTEXT_GETPARAM, i915_gem_context_getparam_ioctl, DRM_UNLOCKED|DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(I915_GEM_CONTEXT_SETPARAM, i915_gem_context_setparam_ioctl, DRM_UNLOCKED|DRM_RENDER_ALLOW),
+//	DRM_IOCTL_DEF_DRV(I915_GEM_VGTBUFFER, i915_gem_vgtbuffer_ioctl, DRM_UNLOCKED | DRM_RENDER_ALLOW),
 };
 
 int i915_max_ioctl = ARRAY_SIZE(i915_ioctls);
-
-/*
- * This is really ugly: Because old userspace abused the linux agp interface to
- * manage the gtt, we need to claim that all intel devices are agp.  For
- * otherwise the drm core refuses to initialize the agp support code.
- */
-int i915_driver_device_is_agp(struct drm_device *dev)
-{
-	return 1;
-}

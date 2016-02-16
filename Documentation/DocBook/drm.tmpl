@@ -3982,7 +3982,6 @@ int num_ioctls;</synopsis>
         <title>Interrupt Handling</title>
 !Pdrivers/gpu/drm/i915/i915_irq.c interrupt handling
 !Fdrivers/gpu/drm/i915/i915_irq.c intel_irq_init intel_irq_init_hw intel_hpd_init
-!Fdrivers/gpu/drm/i915/i915_irq.c intel_irq_fini
 !Fdrivers/gpu/drm/i915/i915_irq.c intel_runtime_pm_disable_interrupts
 !Fdrivers/gpu/drm/i915/i915_irq.c intel_runtime_pm_enable_interrupts
       </sect2>
@@ -4012,7 +4011,6 @@ int num_ioctls;</synopsis>
         <title>Frontbuffer Tracking</title>
 !Pdrivers/gpu/drm/i915/intel_frontbuffer.c frontbuffer tracking
 !Idrivers/gpu/drm/i915/intel_frontbuffer.c
-!Fdrivers/gpu/drm/i915/intel_drv.h intel_frontbuffer_flip
 !Fdrivers/gpu/drm/i915/i915_gem.c i915_gem_track_fb
       </sect2>
       <sect2>
@@ -4045,6 +4043,11 @@ int num_ioctls;</synopsis>
         </para>
       </sect2>
       <sect2>
+        <title>Hotplug</title>
+!Pdrivers/gpu/drm/i915/intel_hotplug.c Hotplug
+!Idrivers/gpu/drm/i915/intel_hotplug.c
+      </sect2>
+      <sect2>
 	<title>High Definition Audio</title>
 !Pdrivers/gpu/drm/i915/intel_audio.c High Definition Audio over HDMI and Display Port
 !Idrivers/gpu/drm/i915/intel_audio.c
@@ -4073,92 +4076,6 @@ int num_ioctls;</synopsis>
       <sect2>
         <title>DPIO</title>
 !Pdrivers/gpu/drm/i915/i915_reg.h DPIO
-	<table id="dpiox2">
-	  <title>Dual channel PHY (VLV/CHV/BXT)</title>
-	  <tgroup cols="8">
-	    <colspec colname="c0" />
-	    <colspec colname="c1" />
-	    <colspec colname="c2" />
-	    <colspec colname="c3" />
-	    <colspec colname="c4" />
-	    <colspec colname="c5" />
-	    <colspec colname="c6" />
-	    <colspec colname="c7" />
-	    <spanspec spanname="ch0" namest="c0" nameend="c3" />
-	    <spanspec spanname="ch1" namest="c4" nameend="c7" />
-	    <spanspec spanname="ch0pcs01" namest="c0" nameend="c1" />
-	    <spanspec spanname="ch0pcs23" namest="c2" nameend="c3" />
-	    <spanspec spanname="ch1pcs01" namest="c4" nameend="c5" />
-	    <spanspec spanname="ch1pcs23" namest="c6" nameend="c7" />
-	    <thead>
-	      <row>
-		<entry spanname="ch0">CH0</entry>
-		<entry spanname="ch1">CH1</entry>
-	      </row>
-	    </thead>
-	    <tbody valign="top" align="center">
-	      <row>
-		<entry spanname="ch0">CMN/PLL/REF</entry>
-		<entry spanname="ch1">CMN/PLL/REF</entry>
-	      </row>
-	      <row>
-		<entry spanname="ch0pcs01">PCS01</entry>
-		<entry spanname="ch0pcs23">PCS23</entry>
-		<entry spanname="ch1pcs01">PCS01</entry>
-		<entry spanname="ch1pcs23">PCS23</entry>
-	      </row>
-	      <row>
-		<entry>TX0</entry>
-		<entry>TX1</entry>
-		<entry>TX2</entry>
-		<entry>TX3</entry>
-		<entry>TX0</entry>
-		<entry>TX1</entry>
-		<entry>TX2</entry>
-		<entry>TX3</entry>
-	      </row>
-	      <row>
-		<entry spanname="ch0">DDI0</entry>
-		<entry spanname="ch1">DDI1</entry>
-	      </row>
-	    </tbody>
-	  </tgroup>
-	</table>
-	<table id="dpiox1">
-	  <title>Single channel PHY (CHV/BXT)</title>
-	  <tgroup cols="4">
-	    <colspec colname="c0" />
-	    <colspec colname="c1" />
-	    <colspec colname="c2" />
-	    <colspec colname="c3" />
-	    <spanspec spanname="ch0" namest="c0" nameend="c3" />
-	    <spanspec spanname="ch0pcs01" namest="c0" nameend="c1" />
-	    <spanspec spanname="ch0pcs23" namest="c2" nameend="c3" />
-	    <thead>
-	      <row>
-		<entry spanname="ch0">CH0</entry>
-	      </row>
-	    </thead>
-	    <tbody valign="top" align="center">
-	      <row>
-		<entry spanname="ch0">CMN/PLL/REF</entry>
-	      </row>
-	      <row>
-		<entry spanname="ch0pcs01">PCS01</entry>
-		<entry spanname="ch0pcs23">PCS23</entry>
-	      </row>
-	      <row>
-		<entry>TX0</entry>
-		<entry>TX1</entry>
-		<entry>TX2</entry>
-		<entry>TX3</entry>
-	      </row>
-	      <row>
-		<entry spanname="ch0">DDI2</entry>
-	      </row>
-	    </tbody>
-	  </tgroup>
-	</table>
       </sect2>
 
       <sect2>
@@ -4195,6 +4112,23 @@ int num_ioctls;</synopsis>
 !Idrivers/gpu/drm/i915/i915_gem_gtt.c
       </sect2>
       <sect2>
+        <title>GTT Fences and Swizzling</title>
+!Idrivers/gpu/drm/i915/i915_gem_fence.c
+        <sect3>
+          <title>Global GTT Fence Handling</title>
+!Pdrivers/gpu/drm/i915/i915_gem_fence.c fence register handling
+        </sect3>
+        <sect3>
+          <title>Hardware Tiling and Swizzling Details</title>
+!Pdrivers/gpu/drm/i915/i915_gem_fence.c tiling swizzling details
+        </sect3>
+      </sect2>
+      <sect2>
+        <title>Object Tiling IOCTLs</title>
+!Idrivers/gpu/drm/i915/i915_gem_tiling.c
+!Pdrivers/gpu/drm/i915/i915_gem_tiling.c buffer object tiling
+      </sect2>
+      <sect2>
         <title>Buffer Object Eviction</title>
 	<para>
 	  This section documents the interface functions for evicting buffer
@@ -4217,6 +4151,20 @@ int num_ioctls;</synopsis>
 !Idrivers/gpu/drm/i915/i915_gem_shrinker.c
       </sect2>
     </sect1>
+    <sect1>
+      <title>GuC-based Command Submission</title>
+      <sect2>
+        <title>GuC</title>
+!Pdrivers/gpu/drm/i915/intel_guc_loader.c GuC-specific firmware loader
+!Idrivers/gpu/drm/i915/intel_guc_loader.c
+      </sect2>
+      <sect2>
+        <title>GuC Client</title>
+!Pdrivers/gpu/drm/i915/i915_guc_submission.c GuC-based command submissison
+!Idrivers/gpu/drm/i915/i915_guc_submission.c
+      </sect2>
+    </sect1>
+
     <sect1>
       <title> Tracing </title>
       <para>

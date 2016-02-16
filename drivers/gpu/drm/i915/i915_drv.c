@@ -40,6 +40,8 @@
 #include <linux/pm_runtime.h>
 #include <drm/drm_crtc_helper.h>
 
+bool i915_host_mediate __read_mostly = false;
+
 static struct drm_driver driver;
 
 #define GEN_DEFAULT_PIPEOFFSETS \
@@ -356,26 +358,26 @@ static const struct intel_device_info intel_cherryview_info = {
 };
 
 static const struct intel_device_info intel_skylake_info = {
-	.is_preliminary = 1,
 	.is_skylake = 1,
 	.gen = 9, .num_pipes = 3,
 	.need_gfx_hws = 1, .has_hotplug = 1,
 	.ring_mask = RENDER_RING | BSD_RING | BLT_RING | VEBOX_RING,
 	.has_llc = 1,
 	.has_ddi = 1,
+	.has_fpga_dbg = 1,
 	.has_fbc = 1,
 	GEN_DEFAULT_PIPEOFFSETS,
 	IVB_CURSOR_OFFSETS,
 };
 
 static const struct intel_device_info intel_skylake_gt3_info = {
-	.is_preliminary = 1,
 	.is_skylake = 1,
 	.gen = 9, .num_pipes = 3,
 	.need_gfx_hws = 1, .has_hotplug = 1,
 	.ring_mask = RENDER_RING | BSD_RING | BLT_RING | VEBOX_RING | BSD2_RING,
 	.has_llc = 1,
 	.has_ddi = 1,
+	.has_fpga_dbg = 1,
 	.has_fbc = 1,
 	GEN_DEFAULT_PIPEOFFSETS,
 	IVB_CURSOR_OFFSETS,
@@ -388,6 +390,7 @@ static const struct intel_device_info intel_broxton_info = {
 	.ring_mask = RENDER_RING | BSD_RING | BLT_RING | VEBOX_RING,
 	.num_pipes = 3,
 	.has_ddi = 1,
+	.has_fpga_dbg = 1,
 	.has_fbc = 1,
 	GEN_DEFAULT_PIPEOFFSETS,
 	IVB_CURSOR_OFFSETS,
@@ -433,6 +436,7 @@ static const struct intel_device_info intel_broxton_info = {
 	INTEL_SKL_GT1_IDS(&intel_skylake_info),	\
 	INTEL_SKL_GT2_IDS(&intel_skylake_info),	\
 	INTEL_SKL_GT3_IDS(&intel_skylake_gt3_info),	\
+	INTEL_SKL_GT4_IDS(&intel_skylake_gt3_info), \
 	INTEL_BXT_IDS(&intel_broxton_info)
 
 static const struct pci_device_id pciidlist[] = {		/* aka */
@@ -440,14 +444,14 @@ static const struct pci_device_id pciidlist[] = {		/* aka */
 	{0, 0, 0}
 };
 
-#if defined(CONFIG_DRM_I915_KMS)
 MODULE_DEVICE_TABLE(pci, pciidlist);
-#endif
 
 void intel_detect_pch(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	struct pci_dev *pch = NULL;
+
+	printk("i915: intel_detect_pch\n");
 
 	/* In all current cases, num_pipes is equivalent to the PCH_NOP setting
 	 * (which really amounts to a PCH but no South Display).
@@ -541,21 +545,6 @@ bool i915_semaphore_is_enabled(struct drm_device *dev)
 	return true;
 }
 
-void intel_hpd_cancel_work(struct drm_i915_private *dev_priv)
-{
-	spin_lock_irq(&dev_priv->irq_lock);
-
-	dev_priv->long_hpd_port_mask = 0;
-	dev_priv->short_hpd_port_mask = 0;
-	dev_priv->hpd_event_bits = 0;
-
-	spin_unlock_irq(&dev_priv->irq_lock);
-
-	cancel_work_sync(&dev_priv->dig_port_work);
-	cancel_work_sync(&dev_priv->hotplug_work);
-	cancel_delayed_work_sync(&dev_priv->hotplug_reenable_work);
-}
-
 void i915_firmware_load_error_print(const char *fw_path, int err)
 {
 	DRM_ERROR("failed to load firmware %s (%d)\n", fw_path, err);
@@ -601,7 +590,6 @@ static int bxt_resume_prepare(struct drm_i915_private *dev_priv);
 static int i915_drm_suspend(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct drm_crtc *crtc;
 	pci_power_t opregion_target_state;
 	int error;
 
@@ -632,8 +620,7 @@ static int i915_drm_suspend(struct drm_device *dev)
 	 * for _thaw. Also, power gate the CRTC power wells.
 	 */
 	drm_modeset_lock_all(dev);
-	for_each_crtc(dev, crtc)
-		intel_crtc_control(crtc, false);
+	intel_display_suspend(dev);
 	drm_modeset_unlock_all(dev);
 
 	intel_dp_mst_suspend(dev);
@@ -727,6 +714,7 @@ int i915_suspend_legacy(struct drm_device *dev, pm_message_t state)
 static int i915_drm_resume(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = dev->dev_private;
+	int ret = 0;
 
 	mutex_lock(&dev->struct_mutex);
 	i915_gem_restore_gtt_mappings(dev);
@@ -763,7 +751,7 @@ static int i915_drm_resume(struct drm_device *dev)
 	spin_unlock_irq(&dev_priv->irq_lock);
 
 	drm_modeset_lock_all(dev);
-	intel_modeset_setup_hw_state(dev, true);
+	intel_display_resume(dev);
 	drm_modeset_unlock_all(dev);
 
 	intel_dp_mst_resume(dev);
@@ -867,9 +855,6 @@ int i915_reset(struct drm_device *dev)
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	bool simulated;
 	int ret;
-
-	if (!i915.reset)
-		return 0;
 
 	intel_reset_gt_powersave(dev);
 
@@ -979,6 +964,7 @@ static int i915_pm_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct drm_device *drm_dev = pci_get_drvdata(pdev);
+	int error;
 
 	if (!drm_dev || !drm_dev->dev_private) {
 		dev_err(dev, "DRM not initialized, aborting suspend.\n");
@@ -988,7 +974,18 @@ static int i915_pm_suspend(struct device *dev)
 	if (drm_dev->switch_power_state == DRM_SWITCH_POWER_OFF)
 		return 0;
 
-	return i915_drm_suspend(drm_dev);
+	error = i915_drm_suspend(drm_dev);
+	if (error)
+		return error;
+
+#ifdef CONFIG_I915_VGT
+	if (i915_host_mediate) {
+		error = vgt_suspend(pdev);
+		if (error)
+			return error;
+	}
+#endif
+	return 0;
 }
 
 static int i915_pm_suspend_late(struct device *dev)
@@ -1036,6 +1033,14 @@ static int i915_pm_resume(struct device *dev)
 
 	if (drm_dev->switch_power_state == DRM_SWITCH_POWER_OFF)
 		return 0;
+
+#ifdef DRM_I915_VGT_SUPPORT
+	if (i915_host_mediate) {
+		int error = vgt_resume(drm_dev->pdev);
+		if (error)
+			return error;
+	}
+#endif
 
 	return i915_drm_resume(drm_dev);
 }
@@ -1518,7 +1523,15 @@ static int intel_runtime_suspend(struct device *device)
 	 * FIXME: We really should find a document that references the arguments
 	 * used below!
 	 */
-	if (IS_HASWELL(dev)) {
+	if (IS_BROADWELL(dev)) {
+		/*
+		 * On Broadwell, if we use PCI_D1 the PCH DDI ports will stop
+		 * being detected, and the call we do at intel_runtime_resume()
+		 * won't be able to restore them. Since PCI_D3hot matches the
+		 * actual specification and appears to be working, use it.
+		 */
+		intel_opregion_notify_adapter(dev, PCI_D3hot);
+	} else {
 		/*
 		 * current versions of firmware which depend on this opregion
 		 * notification have repurposed the D1 definition to mean
@@ -1527,16 +1540,6 @@ static int intel_runtime_suspend(struct device *device)
 		 * the suspend path.
 		 */
 		intel_opregion_notify_adapter(dev, PCI_D1);
-	} else {
-		/*
-		 * On Broadwell, if we use PCI_D1 the PCH DDI ports will stop
-		 * being detected, and the call we do at intel_runtime_resume()
-		 * won't be able to restore them. Since PCI_D3hot matches the
-		 * actual specification and appears to be working, use it. Let's
-		 * assume the other non-Haswell platforms will stay the same as
-		 * Broadwell.
-		 */
-		intel_opregion_notify_adapter(dev, PCI_D3hot);
 	}
 
 	assert_forcewakes_inactive(dev_priv);
@@ -1676,7 +1679,6 @@ static struct drm_driver driver = {
 	 * deal with them for Intel hardware.
 	 */
 	.driver_features =
-	    DRIVER_USE_AGP |
 	    DRIVER_HAVE_IRQ | DRIVER_IRQ_SHARED | DRIVER_GEM | DRIVER_PRIME |
 	    DRIVER_RENDER,
 	.load = i915_driver_load,
@@ -1691,7 +1693,6 @@ static struct drm_driver driver = {
 	.suspend = i915_suspend_legacy,
 	.resume = i915_resume_legacy,
 
-	.device_is_agp = i915_driver_device_is_agp,
 #if defined(CONFIG_DEBUG_FS)
 	.debugfs_init = i915_debugfs_init,
 	.debugfs_cleanup = i915_debugfs_cleanup,
@@ -1730,20 +1731,14 @@ static int __init i915_init(void)
 	driver.num_ioctls = i915_max_ioctl;
 
 	/*
-	 * If CONFIG_DRM_I915_KMS is set, default to KMS unless
-	 * explicitly disabled with the module pararmeter.
-	 *
-	 * Otherwise, just follow the parameter (defaulting to off).
-	 *
-	 * Allow optional vga_text_mode_force boot option to override
-	 * the default behavior.
+	 * Enable KMS by default, unless explicitly overriden by
+	 * either the i915.modeset prarameter or by the
+	 * vga_text_mode_force boot option.
 	 */
-#if defined(CONFIG_DRM_I915_KMS)
-	if (i915.modeset != 0)
-		driver.driver_features |= DRIVER_MODESET;
-#endif
-	if (i915.modeset == 1)
-		driver.driver_features |= DRIVER_MODESET;
+	driver.driver_features |= DRIVER_MODESET;
+
+	if (i915.modeset == 0)
+		driver.driver_features &= ~DRIVER_MODESET;
 
 #ifdef CONFIG_VGA_CONSOLE
 	if (vgacon_text_force() && i915.modeset == -1)

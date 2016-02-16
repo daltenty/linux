@@ -1291,7 +1291,7 @@ static void intel_tv_find_better_format(struct drm_connector *connector)
 		return;
 
 
-	for (i = 0; i < sizeof(tv_modes) / sizeof(*tv_modes); i++) {
+	for (i = 0; i < ARRAY_SIZE(tv_modes); i++) {
 		tv_mode = tv_modes + i;
 
 		if ((intel_tv->type == DRM_MODE_CONNECTOR_Component) ==
@@ -1509,7 +1509,7 @@ out:
 }
 
 static const struct drm_connector_funcs intel_tv_connector_funcs = {
-	.dpms = intel_connector_dpms,
+	.dpms = drm_atomic_helper_connector_dpms,
 	.detect = intel_tv_detect,
 	.destroy = intel_tv_destroy,
 	.set_property = intel_tv_set_property,

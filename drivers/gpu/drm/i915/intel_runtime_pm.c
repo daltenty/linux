@@ -50,7 +50,7 @@
  */
 
 #define GEN9_ENABLE_DC5(dev) 0
-#define SKL_ENABLE_DC6(dev) IS_SKYLAKE(dev)
+#define SKL_ENABLE_DC6(dev) (HAS_CSR(dev) && IS_SKYLAKE(dev))
 
 #define for_each_power_well(i, power_well, domain_mask, power_domains)	\
 	for (i = 0;							\
@@ -67,6 +67,22 @@
 
 bool intel_display_power_well_is_enabled(struct drm_i915_private *dev_priv,
 				    int power_well_id);
+
+static void intel_power_well_enable(struct drm_i915_private *dev_priv,
+				    struct i915_power_well *power_well)
+{
+	DRM_DEBUG_KMS("enabling %s\n", power_well->name);
+	power_well->ops->enable(dev_priv, power_well);
+	power_well->hw_enabled = true;
+}
+
+static void intel_power_well_disable(struct drm_i915_private *dev_priv,
+				     struct i915_power_well *power_well)
+{
+	DRM_DEBUG_KMS("disabling %s\n", power_well->name);
+	power_well->hw_enabled = false;
+	power_well->ops->disable(dev_priv, power_well);
+}
 
 /*
  * We should only use the power well if we explicitly asked the hardware to
@@ -446,7 +462,7 @@ static void assert_can_enable_dc5(struct drm_i915_private *dev_priv)
 					SKL_DISP_PW_2);
 
 	WARN(!IS_SKYLAKE(dev), "Platform doesn't support DC5.\n");
-	WARN(!HAS_RUNTIME_PM(dev), "Runtime PM not enabled.\n");
+	WARN(!HAS_RUNTIME_PM(dev) && !intel_vgpu_active(dev), "Runtime PM not enabled.\n");
 	WARN(pg2_enabled, "PG2 not disabled to enable DC5.\n");
 
 	WARN((I915_READ(DC_STATE_EN) & DC_STATE_EN_UPTO_DC5),
@@ -509,7 +525,7 @@ static void assert_can_enable_dc6(struct drm_i915_private *dev_priv)
 	struct drm_device *dev = dev_priv->dev;
 
 	WARN(!IS_SKYLAKE(dev), "Platform doesn't support DC6.\n");
-	WARN(!HAS_RUNTIME_PM(dev), "Runtime PM not enabled.\n");
+	WARN(!HAS_RUNTIME_PM(dev) && !intel_vgpu_active(dev), "Runtime PM not enabled.\n");
 	WARN(I915_READ(UTIL_PIN_CTL) & UTIL_PIN_ENABLE,
 		"Backlight is not disabled.\n");
 	WARN((I915_READ(DC_STATE_EN) & DC_STATE_EN_UPTO_DC6),
@@ -835,12 +851,27 @@ static bool vlv_power_well_enabled(struct drm_i915_private *dev_priv,
 	return enabled;
 }
 
-static void vlv_display_power_well_enable(struct drm_i915_private *dev_priv,
-					  struct i915_power_well *power_well)
+static void vlv_display_power_well_init(struct drm_i915_private *dev_priv)
 {
-	WARN_ON_ONCE(power_well->data != PUNIT_POWER_WELL_DISP2D);
+	enum pipe pipe;
 
-	vlv_set_power_well(dev_priv, power_well, true);
+	/*
+	 * Enable the CRI clock source so we can get at the
+	 * display and the reference clock for VGA
+	 * hotplug / manual detection. Supposedly DSI also
+	 * needs the ref clock up and running.
+	 *
+	 * CHV DPLL B/C have some issues if VGA mode is enabled.
+	 */
+	for_each_pipe(dev_priv->dev, pipe) {
+		u32 val = I915_READ(DPLL(pipe));
+
+		val |= DPLL_REF_CLK_ENABLE_VLV | DPLL_VGA_MODE_DIS;
+		if (pipe != PIPE_A)
+			val |= DPLL_INTEGRATED_CRI_CLK_VLV;
+
+		I915_WRITE(DPLL(pipe), val);
+	}
 
 	spin_lock_irq(&dev_priv->irq_lock);
 	valleyview_enable_display_irqs(dev_priv);
@@ -858,18 +889,33 @@ static void vlv_display_power_well_enable(struct drm_i915_private *dev_priv,
 	i915_redisable_vga_power_on(dev_priv->dev);
 }
 
+static void vlv_display_power_well_deinit(struct drm_i915_private *dev_priv)
+{
+	spin_lock_irq(&dev_priv->irq_lock);
+	valleyview_disable_display_irqs(dev_priv);
+	spin_unlock_irq(&dev_priv->irq_lock);
+
+	vlv_power_sequencer_reset(dev_priv);
+}
+
+static void vlv_display_power_well_enable(struct drm_i915_private *dev_priv,
+					  struct i915_power_well *power_well)
+{
+	WARN_ON_ONCE(power_well->data != PUNIT_POWER_WELL_DISP2D);
+
+	vlv_set_power_well(dev_priv, power_well, true);
+
+	vlv_display_power_well_init(dev_priv);
+}
+
 static void vlv_display_power_well_disable(struct drm_i915_private *dev_priv,
 					   struct i915_power_well *power_well)
 {
 	WARN_ON_ONCE(power_well->data != PUNIT_POWER_WELL_DISP2D);
 
-	spin_lock_irq(&dev_priv->irq_lock);
-	valleyview_disable_display_irqs(dev_priv);
-	spin_unlock_irq(&dev_priv->irq_lock);
+	vlv_display_power_well_deinit(dev_priv);
 
 	vlv_set_power_well(dev_priv, power_well, false);
-
-	vlv_power_sequencer_reset(dev_priv);
 }
 
 static void vlv_dpio_cmn_power_well_enable(struct drm_i915_private *dev_priv,
@@ -877,13 +923,7 @@ static void vlv_dpio_cmn_power_well_enable(struct drm_i915_private *dev_priv,
 {
 	WARN_ON_ONCE(power_well->data != PUNIT_POWER_WELL_DPIO_CMN_BC);
 
-	/*
-	 * Enable the CRI clock source so we can get at the
-	 * display and the reference clock for VGA
-	 * hotplug / manual detection.
-	 */
-	I915_WRITE(DPLL(PIPE_B), I915_READ(DPLL(PIPE_B)) |
-		   DPLL_REFA_CLK_ENABLE_VLV | DPLL_INTEGRATED_CRI_CLK_VLV);
+	/* since ref/cri clock was enabled */
 	udelay(1); /* >10ns for cmnreset, >0ns for sidereset */
 
 	vlv_set_power_well(dev_priv, power_well, true);
@@ -922,26 +962,21 @@ static void chv_dpio_cmn_power_well_enable(struct drm_i915_private *dev_priv,
 					   struct i915_power_well *power_well)
 {
 	enum dpio_phy phy;
+	enum pipe pipe;
+	uint32_t tmp;
 
 	WARN_ON_ONCE(power_well->data != PUNIT_POWER_WELL_DPIO_CMN_BC &&
 		     power_well->data != PUNIT_POWER_WELL_DPIO_CMN_D);
 
-	/*
-	 * Enable the CRI clock source so we can get at the
-	 * display and the reference clock for VGA
-	 * hotplug / manual detection.
-	 */
 	if (power_well->data == PUNIT_POWER_WELL_DPIO_CMN_BC) {
+		pipe = PIPE_A;
 		phy = DPIO_PHY0;
-		I915_WRITE(DPLL(PIPE_B), I915_READ(DPLL(PIPE_B)) |
-			   DPLL_REFA_CLK_ENABLE_VLV);
-		I915_WRITE(DPLL(PIPE_B), I915_READ(DPLL(PIPE_B)) |
-			   DPLL_REFA_CLK_ENABLE_VLV | DPLL_INTEGRATED_CRI_CLK_VLV);
 	} else {
+		pipe = PIPE_C;
 		phy = DPIO_PHY1;
-		I915_WRITE(DPLL(PIPE_C), I915_READ(DPLL(PIPE_C)) |
-			   DPLL_REFA_CLK_ENABLE_VLV | DPLL_INTEGRATED_CRI_CLK_VLV);
 	}
+
+	/* since ref/cri clock was enabled */
 	udelay(1); /* >10ns for cmnreset, >0ns for sidereset */
 	vlv_set_power_well(dev_priv, power_well, true);
 
@@ -949,8 +984,36 @@ static void chv_dpio_cmn_power_well_enable(struct drm_i915_private *dev_priv,
 	if (wait_for(I915_READ(DISPLAY_PHY_STATUS) & PHY_POWERGOOD(phy), 1))
 		DRM_ERROR("Display PHY %d is not power up\n", phy);
 
+	mutex_lock(&dev_priv->sb_lock);
+
+	/* Enable dynamic power down */
+	tmp = vlv_dpio_read(dev_priv, pipe, CHV_CMN_DW28);
+	tmp |= DPIO_DYNPWRDOWNEN_CH0 | DPIO_CL1POWERDOWNEN |
+		DPIO_SUS_CLK_CONFIG_GATE_CLKREQ;
+	vlv_dpio_write(dev_priv, pipe, CHV_CMN_DW28, tmp);
+
+	if (power_well->data == PUNIT_POWER_WELL_DPIO_CMN_BC) {
+		tmp = vlv_dpio_read(dev_priv, pipe, _CHV_CMN_DW6_CH1);
+		tmp |= DPIO_DYNPWRDOWNEN_CH1;
+		vlv_dpio_write(dev_priv, pipe, _CHV_CMN_DW6_CH1, tmp);
+	} else {
+		/*
+		 * Force the non-existing CL2 off. BXT does this
+		 * too, so maybe it saves some power even though
+		 * CL2 doesn't exist?
+		 */
+		tmp = vlv_dpio_read(dev_priv, pipe, CHV_CMN_DW30);
+		tmp |= DPIO_CL2_LDOFUSE_PWRENB;
+		vlv_dpio_write(dev_priv, pipe, CHV_CMN_DW30, tmp);
+	}
+
+	mutex_unlock(&dev_priv->sb_lock);
+
 	dev_priv->chv_phy_control |= PHY_COM_LANE_RESET_DEASSERT(phy);
 	I915_WRITE(DISPLAY_PHY_CONTROL, dev_priv->chv_phy_control);
+
+	DRM_DEBUG_KMS("Enabled DPIO PHY%d (PHY_CONTROL=0x%08x)\n",
+		      phy, dev_priv->chv_phy_control);
 }
 
 static void chv_dpio_cmn_power_well_disable(struct drm_i915_private *dev_priv,
@@ -974,6 +1037,64 @@ static void chv_dpio_cmn_power_well_disable(struct drm_i915_private *dev_priv,
 	I915_WRITE(DISPLAY_PHY_CONTROL, dev_priv->chv_phy_control);
 
 	vlv_set_power_well(dev_priv, power_well, false);
+
+	DRM_DEBUG_KMS("Disabled DPIO PHY%d (PHY_CONTROL=0x%08x)\n",
+		      phy, dev_priv->chv_phy_control);
+}
+
+bool chv_phy_powergate_ch(struct drm_i915_private *dev_priv, enum dpio_phy phy,
+			  enum dpio_channel ch, bool override)
+{
+	struct i915_power_domains *power_domains = &dev_priv->power_domains;
+	bool was_override;
+
+	mutex_lock(&power_domains->lock);
+
+	was_override = dev_priv->chv_phy_control & PHY_CH_POWER_DOWN_OVRD_EN(phy, ch);
+
+	if (override == was_override)
+		goto out;
+
+	if (override)
+		dev_priv->chv_phy_control |= PHY_CH_POWER_DOWN_OVRD_EN(phy, ch);
+	else
+		dev_priv->chv_phy_control &= ~PHY_CH_POWER_DOWN_OVRD_EN(phy, ch);
+
+	I915_WRITE(DISPLAY_PHY_CONTROL, dev_priv->chv_phy_control);
+
+	DRM_DEBUG_KMS("Power gating DPIO PHY%d CH%d (DPIO_PHY_CONTROL=0x%08x)\n",
+		      phy, ch, dev_priv->chv_phy_control);
+
+out:
+	mutex_unlock(&power_domains->lock);
+
+	return was_override;
+}
+
+void chv_phy_powergate_lanes(struct intel_encoder *encoder,
+			     bool override, unsigned int mask)
+{
+	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
+	struct i915_power_domains *power_domains = &dev_priv->power_domains;
+	enum dpio_phy phy = vlv_dport_to_phy(enc_to_dig_port(&encoder->base));
+	enum dpio_channel ch = vlv_dport_to_channel(enc_to_dig_port(&encoder->base));
+
+	mutex_lock(&power_domains->lock);
+
+	dev_priv->chv_phy_control &= ~PHY_CH_POWER_DOWN_OVRD(0xf, phy, ch);
+	dev_priv->chv_phy_control |= PHY_CH_POWER_DOWN_OVRD(mask, phy, ch);
+
+	if (override)
+		dev_priv->chv_phy_control |= PHY_CH_POWER_DOWN_OVRD_EN(phy, ch);
+	else
+		dev_priv->chv_phy_control &= ~PHY_CH_POWER_DOWN_OVRD_EN(phy, ch);
+
+	I915_WRITE(DISPLAY_PHY_CONTROL, dev_priv->chv_phy_control);
+
+	DRM_DEBUG_KMS("Power gating DPIO PHY%d CH%d lanes 0x%x (PHY_CONTROL=0x%08x)\n",
+		      phy, ch, mask, dev_priv->chv_phy_control);
+
+	mutex_unlock(&power_domains->lock);
 }
 
 static bool chv_pipe_power_well_enabled(struct drm_i915_private *dev_priv,
@@ -1042,53 +1163,29 @@ out:
 static void chv_pipe_power_well_sync_hw(struct drm_i915_private *dev_priv,
 					struct i915_power_well *power_well)
 {
+	WARN_ON_ONCE(power_well->data != PIPE_A);
+
 	chv_set_pipe_power_well(dev_priv, power_well, power_well->count > 0);
 }
 
 static void chv_pipe_power_well_enable(struct drm_i915_private *dev_priv,
 				       struct i915_power_well *power_well)
 {
-	WARN_ON_ONCE(power_well->data != PIPE_A &&
-		     power_well->data != PIPE_B &&
-		     power_well->data != PIPE_C);
+	WARN_ON_ONCE(power_well->data != PIPE_A);
 
 	chv_set_pipe_power_well(dev_priv, power_well, true);
 
-	if (power_well->data == PIPE_A) {
-		spin_lock_irq(&dev_priv->irq_lock);
-		valleyview_enable_display_irqs(dev_priv);
-		spin_unlock_irq(&dev_priv->irq_lock);
-
-		/*
-		 * During driver initialization/resume we can avoid restoring the
-		 * part of the HW/SW state that will be inited anyway explicitly.
-		 */
-		if (dev_priv->power_domains.initializing)
-			return;
-
-		intel_hpd_init(dev_priv);
-
-		i915_redisable_vga_power_on(dev_priv->dev);
-	}
+	vlv_display_power_well_init(dev_priv);
 }
 
 static void chv_pipe_power_well_disable(struct drm_i915_private *dev_priv,
 					struct i915_power_well *power_well)
 {
-	WARN_ON_ONCE(power_well->data != PIPE_A &&
-		     power_well->data != PIPE_B &&
-		     power_well->data != PIPE_C);
+	WARN_ON_ONCE(power_well->data != PIPE_A);
 
-	if (power_well->data == PIPE_A) {
-		spin_lock_irq(&dev_priv->irq_lock);
-		valleyview_disable_display_irqs(dev_priv);
-		spin_unlock_irq(&dev_priv->irq_lock);
-	}
+	vlv_display_power_well_deinit(dev_priv);
 
 	chv_set_pipe_power_well(dev_priv, power_well, false);
-
-	if (power_well->data == PIPE_A)
-		vlv_power_sequencer_reset(dev_priv);
 }
 
 /**
@@ -1117,11 +1214,8 @@ void intel_display_power_get(struct drm_i915_private *dev_priv,
 	mutex_lock(&power_domains->lock);
 
 	for_each_power_well(i, power_well, BIT(domain), power_domains) {
-		if (!power_well->count++) {
-			DRM_DEBUG_KMS("enabling %s\n", power_well->name);
-			power_well->ops->enable(dev_priv, power_well);
-			power_well->hw_enabled = true;
-		}
+		if (!power_well->count++)
+			intel_power_well_enable(dev_priv, power_well);
 	}
 
 	power_domains->domain_use_count[domain]++;
@@ -1155,11 +1249,8 @@ void intel_display_power_put(struct drm_i915_private *dev_priv,
 	for_each_power_well_rev(i, power_well, BIT(domain), power_domains) {
 		WARN_ON(!power_well->count);
 
-		if (!--power_well->count && i915.disable_power_well) {
-			DRM_DEBUG_KMS("disabling %s\n", power_well->name);
-			power_well->hw_enabled = false;
-			power_well->ops->disable(dev_priv, power_well);
-		}
+		if (!--power_well->count && i915.disable_power_well)
+			intel_power_well_disable(dev_priv, power_well);
 	}
 
 	mutex_unlock(&power_domains->lock);
@@ -1630,19 +1721,72 @@ static void chv_phy_control_init(struct drm_i915_private *dev_priv)
 	 * DISPLAY_PHY_CONTROL can get corrupted if read. As a
 	 * workaround never ever read DISPLAY_PHY_CONTROL, and
 	 * instead maintain a shadow copy ourselves. Use the actual
-	 * power well state to reconstruct the expected initial
-	 * value.
+	 * power well state and lane status to reconstruct the
+	 * expected initial value.
 	 */
 	dev_priv->chv_phy_control =
 		PHY_LDO_SEQ_DELAY(PHY_LDO_DELAY_600NS, DPIO_PHY0) |
 		PHY_LDO_SEQ_DELAY(PHY_LDO_DELAY_600NS, DPIO_PHY1) |
-		PHY_CH_POWER_MODE(PHY_CH_SU_PSR, DPIO_PHY0, DPIO_CH0) |
-		PHY_CH_POWER_MODE(PHY_CH_SU_PSR, DPIO_PHY0, DPIO_CH1) |
-		PHY_CH_POWER_MODE(PHY_CH_SU_PSR, DPIO_PHY1, DPIO_CH0);
-	if (cmn_bc->ops->is_enabled(dev_priv, cmn_bc))
+		PHY_CH_POWER_MODE(PHY_CH_DEEP_PSR, DPIO_PHY0, DPIO_CH0) |
+		PHY_CH_POWER_MODE(PHY_CH_DEEP_PSR, DPIO_PHY0, DPIO_CH1) |
+		PHY_CH_POWER_MODE(PHY_CH_DEEP_PSR, DPIO_PHY1, DPIO_CH0);
+
+	/*
+	 * If all lanes are disabled we leave the override disabled
+	 * with all power down bits cleared to match the state we
+	 * would use after disabling the port. Otherwise enable the
+	 * override and set the lane powerdown bits accding to the
+	 * current lane status.
+	 */
+	if (cmn_bc->ops->is_enabled(dev_priv, cmn_bc)) {
+		uint32_t status = I915_READ(DPLL(PIPE_A));
+		unsigned int mask;
+
+		mask = status & DPLL_PORTB_READY_MASK;
+		if (mask == 0xf)
+			mask = 0x0;
+		else
+			dev_priv->chv_phy_control |=
+				PHY_CH_POWER_DOWN_OVRD_EN(DPIO_PHY0, DPIO_CH0);
+
+		dev_priv->chv_phy_control |=
+			PHY_CH_POWER_DOWN_OVRD(mask, DPIO_PHY0, DPIO_CH0);
+
+		mask = (status & DPLL_PORTC_READY_MASK) >> 4;
+		if (mask == 0xf)
+			mask = 0x0;
+		else
+			dev_priv->chv_phy_control |=
+				PHY_CH_POWER_DOWN_OVRD_EN(DPIO_PHY0, DPIO_CH1);
+
+		dev_priv->chv_phy_control |=
+			PHY_CH_POWER_DOWN_OVRD(mask, DPIO_PHY0, DPIO_CH1);
+
 		dev_priv->chv_phy_control |= PHY_COM_LANE_RESET_DEASSERT(DPIO_PHY0);
-	if (cmn_d->ops->is_enabled(dev_priv, cmn_d))
+	}
+
+	if (cmn_d->ops->is_enabled(dev_priv, cmn_d)) {
+		uint32_t status = I915_READ(DPIO_PHY_STATUS);
+		unsigned int mask;
+
+		mask = status & DPLL_PORTD_READY_MASK;
+
+		if (mask == 0xf)
+			mask = 0x0;
+		else
+			dev_priv->chv_phy_control |=
+				PHY_CH_POWER_DOWN_OVRD_EN(DPIO_PHY1, DPIO_CH0);
+
+		dev_priv->chv_phy_control |=
+			PHY_CH_POWER_DOWN_OVRD(mask, DPIO_PHY1, DPIO_CH0);
+
 		dev_priv->chv_phy_control |= PHY_COM_LANE_RESET_DEASSERT(DPIO_PHY1);
+	}
+
+	I915_WRITE(DISPLAY_PHY_CONTROL, dev_priv->chv_phy_control);
+
+	DRM_DEBUG_KMS("Initial PHY_CONTROL=0x%08x\n",
+		      dev_priv->chv_phy_control);
 }
 
 static void vlv_cmnlane_wa(struct drm_i915_private *dev_priv)
@@ -1688,7 +1832,9 @@ void intel_power_domains_init_hw(struct drm_i915_private *dev_priv)
 	power_domains->initializing = true;
 
 	if (IS_CHERRYVIEW(dev)) {
+		mutex_lock(&power_domains->lock);
 		chv_phy_control_init(dev_priv);
+		mutex_unlock(&power_domains->lock);
 	} else if (IS_VALLEYVIEW(dev)) {
 		mutex_lock(&power_domains->lock);
 		vlv_cmnlane_wa(dev_priv);
